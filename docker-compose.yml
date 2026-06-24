@@ -1,0 +1,203 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.2.2-python3.12
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres-airflow-meta:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    # Airflow 3.x: las tareas ya no acceden a la base de metadatos
+    # directamente; todo pasa por la Task Execution API que expone
+    # el api-server. Este endpoint es obligatorio.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-api-server:8080/execution/"
+    AIRFLOW__API__BASE_URL: "http://localhost:8080"
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # Airflow 3.x usa "Simple Auth Manager" por defecto, que IGNORA
+    # "airflow users create" y genera contraseñas aleatorias. Forzamos
+    # FabAuthManager para tener credenciales fijas y predecibles.
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    _PIP_ADDITIONAL_REQUIREMENTS: apache-airflow-providers-fab
+    # Datos del Data Warehouse EXTERNO (servidor Postgres fuera de este docker-compose)
+    DW_HOST: ${DW_HOST}
+    DW_PORT: ${DW_PORT}
+    DW_DB: ${DW_DB_NAME}
+    DW_USER: ${DW_USER}
+    DW_PASSWORD: ${DW_PASSWORD}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./scripts:/opt/airflow/scripts
+    - ./data:/opt/airflow/data
+    - ./sql:/opt/airflow/sql
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres-airflow-meta:
+      condition: service_healthy
+
+services:
+
+  # ----------------------------------------------------------------
+  # Base de datos de metadatos internos de Airflow (NO es el DW)
+  # ----------------------------------------------------------------
+  postgres-airflow-meta:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+    volumes:
+      - airflow-meta-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER}"]
+      interval: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------
+  # NOTA: el repositorio analítico (Data Warehouse) es un servidor
+  # PostgreSQL EXTERNO, fuera de este docker-compose. No se levanta
+  # ningún contenedor para él; solo nos conectamos via Connection
+  # de Airflow usando las variables DW_HOST / DW_PORT / DW_USER /
+  # DW_PASSWORD del .env. Las tablas NO se crean automáticamente
+  # con docker-entrypoint-initdb.d (eso solo aplica a contenedores
+  # Postgres nuevos); se crean ejecutando el DDL desde airflow-init
+  # o desde una tarea del propio DAG (ver sql/01_create_schema.sql).
+  # ----------------------------------------------------------------
+
+  # ----------------------------------------------------------------
+  # Servicio de inicialización: corre UNA sola vez.
+  # - Migra la base de metadatos
+  # - Crea el usuario admin
+  # - Registra las Connections y Variables del pipeline
+  # - Crea las tablas del DW externo
+  # ----------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    depends_on:
+      postgres-airflow-meta:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+
+        airflow connections delete dw_postgres_conn || true
+        airflow connections add dw_postgres_conn \
+          --conn-type postgres \
+          --conn-host "${DW_HOST}" \
+          --conn-port "${DW_PORT}" \
+          --conn-schema "${DW_DB_NAME}" \
+          --conn-login "${DW_USER}" \
+          --conn-password "${DW_PASSWORD}"
+
+        airflow variables set precio_minimo_valido 0.01
+        airflow variables set pais_default "Unknown"
+        airflow variables set ruta_data_raw "/opt/airflow/data/raw"
+
+        # Crea las tablas del DW si aún no existen (servidor externo,
+        # no hay docker-entrypoint-initdb.d disponible aquí).
+        PGPASSWORD="${DW_PASSWORD}" psql -h "${DW_HOST}" -p "${DW_PORT}" \
+          -U "${DW_USER}" -d "${DW_DB_NAME}" \
+          -f /opt/airflow/sql/01_create_schema.sql || true
+
+        echo "Inicialización completa: migración, connections, variables y esquema listos."
+
+  # ----------------------------------------------------------------
+  # Creación del usuario admin: SEPARADA de airflow-init a propósito.
+  # En Airflow 3.x + FabAuthManager, los roles (Admin, Viewer, etc.)
+  # se sincronizan cuando el api-server arranca por primera vez.
+  # Si "airflow users create" corre ANTES de eso (como en airflow-init),
+  # falla con "AirflowSecurityManagerV2 object has no attribute
+  # find_role" porque el rol "Admin" todavía no existe en la BD.
+  # Por eso este servicio espera a que el api-server esté healthy.
+  # ----------------------------------------------------------------
+  airflow-create-user:
+    <<: *airflow-common
+    depends_on:
+      airflow-api-server:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname "${AIRFLOW_ADMIN_FIRSTNAME}" \
+          --lastname "${AIRFLOW_ADMIN_LASTNAME}" \
+          --role Admin \
+          --email "${AIRFLOW_ADMIN_EMAIL}" || true
+        echo "Usuario admin listo."
+    restart: "no"
+
+  # ----------------------------------------------------------------
+  # API server (Airflow 3.x): reemplaza al antiguo "webserver".
+  # Sirve la UI, la API REST y la Task Execution API que usan
+  # el dag-processor, el triggerer y las tareas en ejecución.
+  # ----------------------------------------------------------------
+  airflow-api-server:
+    <<: *airflow-common
+    container_name: airflow-api-server
+    command: api-server
+    ports:
+      - "8080:8080"
+    depends_on:
+      - airflow-init
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------
+  # Scheduler de Airflow. Ya NO parsea los DAGs (eso lo hace el
+  # dag-processor); solo programa y despacha tareas.
+  # ----------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      - airflow-init
+      - airflow-api-server
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------
+  # Dag processor (nuevo en Airflow 3.x): proceso dedicado que
+  # parsea los archivos en ./dags. Obligatorio incluso con
+  # LocalExecutor.
+  # ----------------------------------------------------------------
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      - airflow-init
+      - airflow-api-server
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------
+  # Triggerer (nuevo como servicio independiente en Airflow 3.x):
+  # corre el event loop para tareas/operadores diferibles.
+  # ----------------------------------------------------------------
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    depends_on:
+      - airflow-init
+      - airflow-api-server
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------
+  # (Opcional / plus) API interna de catálogo de productos
+  # Descomenta si decides implementar el plus con FastAPI
+  # ----------------------------------------------------------------
+  # productos-api:
+  #   build: ./api
+  #   ports:
+  #     - "8000:8000"
+  #   restart: unless-stopped
+
+volumes:
+  airflow-meta-data:
+  airflow-logs:

@@ -1,0 +1,23 @@
+# Variables de entorno con credenciales reales
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Airflow
+logs/
+airflow.cfg
+airflow.db
+*.log
+
+# Sistema / editores
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Docker
+*.pid
