@@ -16,6 +16,7 @@ x-airflow-common: &airflow-common
     # Airflow 3.x usa "Simple Auth Manager" por defecto, que IGNORA
     # "airflow users create" y genera contraseñas aleatorias. Forzamos
     # FabAuthManager para tener credenciales fijas y predecibles.
+    PYTHONPATH: /opt/airflow
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     _PIP_ADDITIONAL_REQUIREMENTS: apache-airflow-providers-fab
     # Datos del Data Warehouse EXTERNO (servidor Postgres fuera de este docker-compose)
